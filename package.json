@@ -1,0 +1,20 @@
+{
+  "name": "grand-villa-whatsapp-bot",
+  "version": "1.0.0",
+  "description": "Backend WhatsApp-бота гостиницы \"Гранд Вилла\" на Express, Whapi.cloud, Supabase и Groq",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.110.2",
+    "axios": "^1.18.1",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^4.22.2",
+    "groq-sdk": "^0.7.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
