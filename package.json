@@ -12,7 +12,8 @@
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^4.22.2",
-    "groq-sdk": "^0.7.0"
+    "groq-sdk": "^0.7.0",
+    "node-cron": "^4.6.0"
   },
   "engines": {
     "node": ">=18.0.0"
