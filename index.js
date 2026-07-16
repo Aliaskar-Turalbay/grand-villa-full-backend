@@ -307,118 +307,76 @@ async function handleIncomingMessage(body) {
 
   console.log(`\n📩 Входящее от [${chatId}]: ${userText}`);
 
+  // ==========================================
+  // 1. ПРОВЕРКА: НЕ ОТКЛЮЧЕН ЛИ ИИ ДЛЯ ЭТОГО ЧАТА РУЧНУЮ
+  // ==========================================
+  // Проверяем последние сообщения в истории. Если там есть маркер отключения ИИ
+  const { data: lastSystemMsg } = await supabase
+    .from('chat_history')
+    .select('content')
+    .eq('chat_id', chatId)
+    .eq('role', 'system')
+    .order('created_at', { ascending: false })
+    .limit(1);
+
+  // Если администратор еще не включил ИИ обратно (например, написав кодовое слово), бот молчит
+  if (lastSystemMsg && lastSystemMsg[0]?.content === '[AI_DISABLED]') {
+    // Кодовое слово для администратора, чтобы вернуть ИИ в чат, когда разговор завершен
+    if (lowerText === 'алия включись' || lowerText === 'алия работай') {
+      await saveMessageToDB(chatId, 'system', '[AI_ENABLED]');
+      await sendGreenApiMessage(chatId, '🤖 ИИ-ассистент снова на связи!');
+      return;
+    }
+    console.log(`🤫 ИИ отключен для чата [${chatId}], общение идет с администратором.`);
+    return;
+  }
+
+  // ==========================================
+  // 2. ПЕРЕХВАТ: КЛИЕНТ ПРОСИТ АДМИНИСТРАТОРА
+  // ==========================================
+  const humanRequests = [
+    'администратор', 'админ', 'человек', 'оператор', 'менеджер', 'ресепшен', 
+    'позови', 'свяжи', 'звонок', 'созвон', 'рецепшен', 'адам', 'администраторды'
+  ];
+
+  const wantsHuman = humanRequests.some(word => lowerText.includes(word));
+
+  if (wantsHuman) {
+    // Сохраняем в базу маркер блокировки ИИ
+    await saveMessageToDB(chatId, 'user', userText);
+    await saveMessageToDB(chatId, 'system', '[AI_DISABLED]');
+
+    const replyText = 
+      `Саламатсыз ба! Қазір сізге администратор жауап береді. Күте тұрыңыз... 😊\n\n` +
+      `Здравствуйте! Передаю диалог администратору гостиницы. Он ответит вам в ближайшее время.`;
+
+    // Отвечаем гостю
+    await sendGreenApiMessage(chatId, replyText);
+    await saveMessageToDB(chatId, 'model', replyText);
+
+    // Срочно уведомляем администратора в WhatsApp
+    if (ADMIN_PHONE) {
+      const guestPhone = chatId.split('@')[0];
+      const alertAdminText = 
+        `⚠️ СРОЧНО: Клиент просит администратора!\n\n` +
+        `📞 Номер: +${guestPhone}\n` +
+        `💬 Последнее сообщение: "${userText}"\n\n` +
+        `🤖 Бот временно отключен в этом чате. Чтобы вернуть бота назад, напишите в этот чат команду: "Алия включись"`;
+      
+      await sendGreenApiMessage(`${ADMIN_PHONE}@c.us`, alertAdminText);
+    }
+    return;
+  }
+
+  // Стандартная обработка (2ГИС)
   if (lowerText.includes('2гис') || lowerText.includes('2gis') || lowerText.includes('нашел вас в')) {
     await sendGreenApiMessage(chatId, MAPS_REFERRAL_TEMPLATE);
     await saveMessageToDB(chatId, 'user', userText);
     await saveMessageToDB(chatId, 'model', MAPS_REFERRAL_TEMPLATE);
     return;
   }
-
-  await saveMessageToDB(chatId, 'user', userText);
-  const dbHistory = await getAIHistory(chatId);
-  const availabilityContext = await buildAvailabilityContext();
-
-  const messagesForGroq = [
-    { role: 'system', content: SYSTEM_PROMPT + availabilityContext },
-    ...dbHistory
-  ];
-
-  let aiText = '';
-  try {
-    const chatCompletion = await groq.chat.completions.create({
-      messages: messagesForGroq,
-      model: GROQ_MODEL,
-      temperature: 0.7,
-      max_tokens: 1024
-    });
-    aiText = chatCompletion.choices[0]?.message?.content?.trim() || '';
-  } catch (groqErr) {
-    console.error('❌ Ошибка Groq API:', groqErr.message);
-    aiText = QUOTA_ERROR_TEMPLATE;
-  }
-
-  if (!aiText) {
-    console.log(`⚠️ ИИ вернул пустой текст для [${chatId}]`);
-    return;
-  }
-
-  const { cleanText, booking } = extractBooking(aiText);
-
-  await sendGreenApiMessage(chatId, cleanText);
-  await saveMessageToDB(chatId, 'model', aiText);
-  console.log(`🤖 Ответил для [${chatId}]: ${cleanText}`);
-
-  if (booking) {
-    console.log('📋 Извлечена заявка из ответа ИИ:', JSON.stringify(booking));
-
-    try {
-      const checkInDate = new Date(booking.checkin_date + 'T00:00:00Z');
-      const nightsCount = parseInt(booking.nights) || 1;
-      const checkOutDate = new Date(checkInDate);
-      checkOutDate.setUTCDate(checkOutDate.getUTCDate() + nightsCount);
-
-      const checkInStr = booking.checkin_date; 
-      const checkOutStr = checkOutDate.toISOString().split('T')[0]; 
-
-      let roomTypeSearch = 'standard';
-      const serviceLower = (booking.service || '').toLowerCase();
-      if (serviceLower.includes('делюкс') || serviceLower.includes('deluxe')) roomTypeSearch = 'deluxe';
-      if (serviceLower.includes('семейный') || serviceLower.includes('suite') || serviceLower.includes('family')) roomTypeSearch = 'suite';
-
-      const { data: allRooms, error: roomsError } = await supabase
-        .from('rooms')
-        .select('id, room_number')
-        .eq('type', roomTypeSearch)
-        .eq('is_active', true);
-
-      if (roomsError || !allRooms || allRooms.length === 0) {
-        throw new Error('Нет доступных комнат выбранной категории в базе данных.');
-      }
-
-      let targetRoom = null;
-
-      for (const room of allRooms) {
-        const { data: conflicts } = await supabase
-          .from('bookings')
-          .select('id')
-          .eq('room_id', room.id)
-          .eq('status', 'confirmed')
-          .lt('check_in', checkOutStr)
-          .gt('check_out', checkInStr);
-
-        if (!conflicts || conflicts.length === 0) {
-          targetRoom = room; 
-          break;
-        }
-      }
-
-      if (!targetRoom) {
-        await sendGreenApiMessage(chatId, "К сожалению, все номера этой категории на выбранные даты уже заняты.");
-        return;
-      }
-
-      const bookingResult = await createBooking({
-        roomId: targetRoom.id,
-        guestName: booking.name,
-        guestPhone: booking.phone,
-        checkIn: checkInStr,
-        checkOut: checkOutStr
-      });
-
-      if (bookingResult.success) {
-        console.log(`💾 ЗАЯВКА УСПЕШНО СОХРАНЕНА ЧЕРЕЗ КЛАСС БРОНИРОВАНИЯ: ${booking.name}`);
-        await notifyAdminAboutBooking(booking, chatId, targetRoom.room_number);
-      } else {
-        console.error('❌ База данных отклонила бронь:', bookingResult.error);
-        await sendGreenApiMessage(chatId, `Ошибка бронирования: ${bookingResult.error}`);
-      }
-
-    } catch (err) {
-      console.error('❌ Ошибка в процессе автоматического бронирования:', err.message);
-      await notifyAdminAboutBooking(booking, chatId, 'Ошибка автоподбора');
-    }
-  }
 }
+  // ... дальше ваш стандартный код с отправкой запроса в Groq ...
 
 // ==============================
 // ЭНДПОИНТ /webhook
