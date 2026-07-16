@@ -4,6 +4,8 @@ const express = require('express');
 const cors = require('cors');
 const ordersRouter = require('./orders_api'); // подключаем наш файл с QR-заказами
 const bookingsRouter = require('./bookings_api'); // подключаем эндпоинт бронирования с сайта
+const { getRoomsAvailability } = require('./rooms_api'); // общая занятость номеров (используем и как роут, и как функцию)
+const roomsRouter = require('./rooms_api');
 const Groq = require('groq-sdk');
 const { createClient } = require('@supabase/supabase-js');
 const { createBooking } = require('./booking.js'); // импортируем функцию бронирования
@@ -18,8 +20,6 @@ app.use(express.json()); // чтобы сервер понимал JSON-запр
 // ==============================
 const ALLOWED_ORIGINS = [
   'https://grand-villa-site.vercel.app',
-  'https://grand-villa-site-omvbgpqk3-aliaskar.vercel.app',
-  'https://grand-villa-site-git-main-aliaskar.vercel.app',
   'http://localhost:5173',
   'http://localhost:3000',
 ];
@@ -39,6 +39,7 @@ app.use(cors({
 
 app.use(ordersRouter);   // активируем эндпоинты /api/orders из файла orders_api.js
 app.use(bookingsRouter); // активируем эндпоинт /api/bookings из файла bookings_api.js
+app.use(roomsRouter);    // активируем эндпоинт /api/rooms/availability из файла rooms_api.js
 
 const PORT = process.env.PORT || 3000;
 
@@ -185,6 +186,42 @@ function extractMessageText(messageData) {
   return null;
 }
 
+// Человекочитаемые названия категорий для сводки занятости, которую видит ИИ
+const ROOM_TYPE_LABELS = { standard: 'Стандарт', deluxe: 'Делюкс', suite: 'Семейный' };
+
+/**
+ * Строит короткую сводку занятости номеров "на сегодня" для системного промпта.
+ * Не блокирует ответ ИИ, если Supabase недоступен — просто возвращает пустую строку,
+ * тогда Алия продолжит работать как раньше, без данных о занятости.
+ */
+async function buildAvailabilityContext() {
+  try {
+    const rooms = await getRoomsAvailability();
+    if (!rooms || rooms.length === 0) return '';
+
+    const grouped = {};
+    for (const room of rooms) {
+      if (!grouped[room.type]) grouped[room.type] = { total: 0, free: 0 };
+      grouped[room.type].total += 1;
+      if (room.is_available) grouped[room.type].free += 1;
+    }
+
+    const lines = Object.entries(grouped).map(
+      ([type, { total, free }]) => `- ${ROOM_TYPE_LABELS[type] || type}: свободно ${free} из ${total}`
+    );
+
+    const today = new Date().toISOString().split('T')[0];
+    return (
+      `\n\nАКТУАЛЬНАЯ ЗАНЯТОСТЬ НОМЕРОВ (на сегодня, ${today}):\n${lines.join('\n')}\n` +
+      `Используй эти цифры, если гость спрашивает про наличие свободных номеров прямо сейчас. ` +
+      `Финальную проверку на конкретные даты брони всё равно выполняет система автоматически при создании брони.`
+    );
+  } catch (err) {
+    console.error('⚠️ Не удалось получить занятость номеров для контекста ИИ:', err.message);
+    return '';
+  }
+}
+
 // ==============================
 // ОБРАБОТКА ОДНОГО СООБЩЕНИЯ
 // ==============================
@@ -212,9 +249,10 @@ async function handleIncomingMessage(body) {
 
   await saveMessageToDB(chatId, 'user', userText);
   const dbHistory = await getAIHistory(chatId);
+  const availabilityContext = await buildAvailabilityContext();
 
   const messagesForGroq = [
-    { role: 'system', content: SYSTEM_PROMPT },
+    { role: 'system', content: SYSTEM_PROMPT + availabilityContext },
     ...dbHistory
   ];
 

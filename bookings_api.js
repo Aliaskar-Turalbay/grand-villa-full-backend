@@ -40,6 +40,36 @@ const CATEGORY_LABELS = {
 };
 
 /**
+ * Ищет конкретный номер по его номеру (например "101") среди активных номеров.
+ */
+async function findRoomByNumber(roomNumber) {
+    const { data: room, error } = await supabase
+        .from('rooms')
+        .select('id, room_number, type')
+        .eq('room_number', roomNumber)
+        .eq('is_active', true)
+        .maybeSingle();
+
+    if (error || !room) return null;
+    return room;
+}
+
+/**
+ * Проверяет, свободен ли КОНКРЕТНЫЙ номер (по id) на заданные даты.
+ */
+async function isRoomFreeOnDates(roomId, checkIn, checkOut) {
+    const { data: conflicts } = await supabase
+        .from('bookings')
+        .select('id')
+        .eq('room_id', roomId)
+        .eq('status', 'confirmed')
+        .lt('check_in', checkOut)
+        .gt('check_out', checkIn);
+
+    return !conflicts || conflicts.length === 0;
+}
+
+/**
  * Ищет первый свободный номер указанного типа на заданные даты.
  * Логика идентична той, что уже используется в index.js для бронирований
  * через WhatsApp — вынесена сюда, чтобы не дублировать код.
@@ -94,12 +124,15 @@ async function notifyAdminAboutSiteBooking({ name, phone, category, checkIn, che
 
 /**
  * POST /api/bookings
- * Body: { name, phone, category, check_in, check_out }
- * Именно этот формат шлёт форма бронирования на сайте (GrandVillaPortal.jsx)
+ * Body: { name, phone, category, check_in, check_out, room_number? }
+ *
+ * Если передан room_number (гость кликнул конкретный номер на сайте) —
+ * бронируем именно его. Если нет — подбираем любой свободный номер
+ * указанной категории (старое поведение, для обратной совместимости).
  */
 router.post('/api/bookings', async (req, res) => {
     try {
-        const { name, phone, category, check_in, check_out } = req.body;
+        const { name, phone, category, check_in, check_out, room_number } = req.body;
 
         if (!name || !phone || !category || !check_in || !check_out) {
             return res.status(400).json({
@@ -115,27 +148,49 @@ router.post('/api/bookings', async (req, res) => {
             });
         }
 
-        const roomType = CATEGORY_TO_ROOM_TYPE[category];
-        if (!roomType) {
-            return res.status(400).json({
-                success: false,
-                error: `Неизвестная категория номера: ${category}`,
-            });
+        let targetRoom = null;
+
+        if (room_number) {
+            // --- Гость выбрал конкретный номер (например 101) ---
+            targetRoom = await findRoomByNumber(String(room_number));
+
+            if (!targetRoom) {
+                return res.status(404).json({
+                    success: false,
+                    error: `Номер ${room_number} не найден.`,
+                });
+            }
+
+            const isFree = await isRoomFreeOnDates(targetRoom.id, check_in, check_out);
+            if (!isFree) {
+                return res.status(409).json({
+                    success: false,
+                    error: `Номер ${room_number} уже забронирован на выбранные даты. Попробуйте другие даты или другой номер.`,
+                });
+            }
+        } else {
+            // --- Старое поведение: подбираем любой свободный номер категории ---
+            const roomType = CATEGORY_TO_ROOM_TYPE[category];
+            if (!roomType) {
+                return res.status(400).json({
+                    success: false,
+                    error: `Неизвестная категория номера: ${category}`,
+                });
+            }
+
+            targetRoom = await findAvailableRoom(roomType, check_in, check_out);
+
+            if (!targetRoom) {
+                return res.status(409).json({
+                    success: false,
+                    error: 'Этот номер уже забронирован на выбранные даты. Попробуйте другие даты или категорию.',
+                });
+            }
         }
 
-        // --- Шаг 1: ищем свободный номер этой категории ---
-        const availableRoom = await findAvailableRoom(roomType, check_in, check_out);
-
-        if (!availableRoom) {
-            return res.status(409).json({
-                success: false,
-                error: 'Этот номер уже забронирован на выбранные даты. Попробуйте другие даты или категорию.',
-            });
-        }
-
-        // --- Шаг 2: создаём бронь через уже существующую защищённую функцию ---
+        // --- Создаём бронь через уже существующую защищённую функцию ---
         const bookingResult = await createBooking({
-            roomId: availableRoom.id,
+            roomId: targetRoom.id,
             guestName: name,
             guestPhone: phone,
             checkIn: check_in,
@@ -152,7 +207,7 @@ router.post('/api/bookings', async (req, res) => {
             });
         }
 
-        // --- Шаг 3: уведомляем администратора (не роняем ответ гостю, если WhatsApp не отправился) ---
+        // --- Уведомляем администратора (не роняем ответ гостю, если WhatsApp не отправился) ---
         try {
             await notifyAdminAboutSiteBooking({
                 name,
@@ -160,7 +215,7 @@ router.post('/api/bookings', async (req, res) => {
                 category,
                 checkIn: check_in,
                 checkOut: check_out,
-                roomNumber: availableRoom.room_number,
+                roomNumber: targetRoom.room_number,
             });
         } catch (notifyError) {
             console.error('Бронь сохранена, но уведомление в WhatsApp не отправлено:', notifyError.message);
@@ -169,6 +224,7 @@ router.post('/api/bookings', async (req, res) => {
         return res.status(200).json({
             success: true,
             booking: bookingResult.booking,
+            room_number: targetRoom.room_number,
         });
 
     } catch (err) {
