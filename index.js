@@ -5,7 +5,7 @@ const cors = require('cors');
 const cron = require('node-cron'); // Подключаем планировщик задач
 const ordersRouter = require('./orders_api'); // подключаем наш файл с QR-заказами
 const bookingsRouter = require('./bookings_api'); // подключаем эндпоинт бронирования с сайта
-const { getRoomsAvailability } = require('./rooms_api'); // общая занятость номеров (используем и как роут, и как функцию)
+const { getRoomsAvailability } = require('./rooms_api'); // общая занятость номеров
 const roomsRouter = require('./rooms_api');
 const Groq = require('groq-sdk');
 const { createClient } = require('@supabase/supabase-js');
@@ -45,9 +45,7 @@ const PORT = process.env.PORT || 3000;
 
 // ==============================
 // КОНСТАНТЫ / КЛЮЧИ ДОСТУПА
-// Все секреты теперь читаются из .env (см. .env.example)
 // ==============================
-
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
@@ -82,6 +80,8 @@ const SYSTEM_PROMPT = `Ты — Алия, ИИ-ассистентка ресеп
 
 ТЕЛЕФОН ОБЯЗАТЕЛЕН. Без номера телефона бронь оформить нельзя — это правило без исключений. Если клиент называет все остальные данные, но не оставил телефон, не отправляй маркер [[BOOKING_READY]] — вежливо попроси телефон отдельным вопросом ("Оставьте, пожалуйста, номер телефона для подтверждения брони") и жди ответа. Если клиент уклоняется или спрашивает "зачем" — коротко объясни: номер нужен, чтобы администратор мог подтвердить бронь и связаться в случае вопросов.
 
+Главное правило — НЕ ВЕДИ ДОПРОС. ...
+
 Главное правило — НЕ ВЕДИ ДОПРОС. Смотри, что клиент уже написал (в этом сообщении и раньше в переписке), и спрашивай только то, чего реально не хватает — одним компактным вопросом, а не по одному пункту за раз. Если клиент написал всё сразу — сразу переходи к подтверждению, не переспрашивай то, что уже сказано.
 
 Как только есть все данные — одной фразой подтверди детали клиенту, а сразу следом, на новой строке, добавь маркер (клиент его не видит, объяснять не нужно):
@@ -96,25 +96,20 @@ const MAPS_REFERRAL_TEMPLATE = `Саламатсыз ба! 😊 Рахмет, у
 // ==============================
 // АВТОМАТИЧЕСКИЙ ВЫЕЗД ПОСЛЕ 12:00 (CRON TASK)
 // ==============================
-// Запуск скрипта каждый час в 00 минут (например, 12:00, 13:00, 14:00 и т.д.)
 cron.schedule('0 * * * *', async () => {
   console.log('🔄 [CRON] Запуск плановой проверки времени выезда (Check-out)...');
   
   const now = new Date();
   const currentHour = now.getHours();
 
-  // Если время еще не дошло до 12:00 обеда, проверку пропускаем
   if (currentHour < 12) {
     console.log('--- [CRON] Время выезда (12:00) для сегодняшнего дня еще не наступило. ---');
     return;
   }
 
   try {
-    // Получаем сегодняшнюю дату в формате YYYY-MM-DD
     const todayStr = now.toISOString().split('T')[0];
 
-    // Выбираем из базы все бронирования, у которых дата check_out уже наступила или прошла,
-    // но статус всё еще 'confirmed'
     const { data: activeBookings, error: fetchError } = await supabase
       .from('bookings')
       .select('id, room_id, check_out, guest_name')
@@ -125,22 +120,17 @@ cron.schedule('0 * * * *', async () => {
 
     if (activeBookings && activeBookings.length > 0) {
       const expiredBookingIds = [];
-      const roomsToFree = [];
 
       for (const booking of activeBookings) {
-        // Устанавливаем точный лимит выезда на 12:00:00 для даты выезда
         const checkOutDeadline = new Date(`${booking.check_out}T12:00:00`);
 
-        // Если текущее время больше или равно 12:00 дня выезда гостя
         if (now >= checkOutDeadline) {
           expiredBookingIds.push(booking.id);
-          roomsToFree.push(booking.room_id);
-          console.log(`⏳ Обнаружен выезд: Гость ${booking.guest_name} должен освободить комнату ID: ${booking.room_id} (Дата выезда: ${booking.check_out} после 12:00)`);
+          console.log(`⏳ Обнаружен выезд: Гость ${booking.guest_name} освобождает комнату ID: ${booking.room_id} (Выезд после 12:00)`);
         }
       }
 
       if (expiredBookingIds.length > 0) {
-        // 1. Переводим завершенные бронирования из 'confirmed' в 'completed'
         const { error: updateBookingError } = await supabase
           .from('bookings')
           .update({ status: 'completed' })
@@ -150,9 +140,8 @@ cron.schedule('0 * * * *', async () => {
 
         console.log(`✅ [CRON] ${expiredBookingIds.length} бронирований успешно переведены в статус 'completed'.`);
 
-        // 2. Отправляем короткое сводное уведомление администратору в WhatsApp через Green-API
         if (ADMIN_PHONE) {
-          const notificationText = `🔔 Системное уведомление: Наступило время выезда (12:00). В базе данных завершено бронирований: ${expiredBookingIds.length}.`;
+          const notificationText = `🔔 Системное уведомление: Наступило время выезда (12:00). В базе данных автоматически завершено бронирований: ${expiredBookingIds.length}.`;
           await sendGreenApiMessage(`${ADMIN_PHONE}@c.us`, notificationText);
         }
       } else {
@@ -290,9 +279,8 @@ async function buildAvailabilityContext() {
 }
 
 // ==============================
-// ОБРАБОТКА ОДНОГО СООБЩЕНИЯ
+// ОБРАБОТКА ОДНОГО СООБЩЕНИЯ (С ПЕРЕХВАТОМ АДМИНИСТРАТОРА)
 // ==============================
-
 async function handleIncomingMessage(body) {
   if (!body || body.typeWebhook !== 'incomingMessageReceived') return;
 
@@ -307,10 +295,7 @@ async function handleIncomingMessage(body) {
 
   console.log(`\n📩 Входящее от [${chatId}]: ${userText}`);
 
-  // ==========================================
-  // 1. ПРОВЕРКА: НЕ ОТКЛЮЧЕН ЛИ ИИ ДЛЯ ЭТОГО ЧАТА РУЧНУЮ
-  // ==========================================
-  // Проверяем последние сообщения в истории. Если там есть маркер отключения ИИ
+  // 1. ПРОВЕРКА БЛОКИРОВКИ ИИ (Если администратор забрал управление чатом)
   const { data: lastSystemMsg } = await supabase
     .from('chat_history')
     .select('content')
@@ -319,21 +304,18 @@ async function handleIncomingMessage(body) {
     .order('created_at', { ascending: false })
     .limit(1);
 
-  // Если администратор еще не включил ИИ обратно (например, написав кодовое слово), бот молчит
   if (lastSystemMsg && lastSystemMsg[0]?.content === '[AI_DISABLED]') {
-    // Кодовое слово для администратора, чтобы вернуть ИИ в чат, когда разговор завершен
+    // Команда активации ИИ обратно
     if (lowerText === 'алия включись' || lowerText === 'алия работай') {
       await saveMessageToDB(chatId, 'system', '[AI_ENABLED]');
       await sendGreenApiMessage(chatId, '🤖 ИИ-ассистент снова на связи!');
       return;
     }
-    console.log(`🤫 ИИ отключен для чата [${chatId}], общение идет с администратором.`);
+    console.log(`🤫 ИИ отключен для чата [${chatId}], общение идет в ручном режиме.`);
     return;
   }
 
-  // ==========================================
-  // 2. ПЕРЕХВАТ: КЛИЕНТ ПРОСИТ АДМИНИСТРАТОРА
-  // ==========================================
+  // 2. АВТОПЕРЕХВАТ: Если гость просит позвать человека
   const humanRequests = [
     'администратор', 'админ', 'человек', 'оператор', 'менеджер', 'ресепшен', 
     'позови', 'свяжи', 'звонок', 'созвон', 'рецепшен', 'адам', 'администраторды'
@@ -342,7 +324,6 @@ async function handleIncomingMessage(body) {
   const wantsHuman = humanRequests.some(word => lowerText.includes(word));
 
   if (wantsHuman) {
-    // Сохраняем в базу маркер блокировки ИИ
     await saveMessageToDB(chatId, 'user', userText);
     await saveMessageToDB(chatId, 'system', '[AI_DISABLED]');
 
@@ -350,45 +331,146 @@ async function handleIncomingMessage(body) {
       `Саламатсыз ба! Қазір сізге администратор жауап береді. Күте тұрыңыз... 😊\n\n` +
       `Здравствуйте! Передаю диалог администратору гостиницы. Он ответит вам в ближайшее время.`;
 
-    // Отвечаем гостю
     await sendGreenApiMessage(chatId, replyText);
     await saveMessageToDB(chatId, 'model', replyText);
 
-    // Срочно уведомляем администратора в WhatsApp
     if (ADMIN_PHONE) {
       const guestPhone = chatId.split('@')[0];
       const alertAdminText = 
         `⚠️ СРОЧНО: Клиент просит администратора!\n\n` +
         `📞 Номер: +${guestPhone}\n` +
-        `💬 Последнее сообщение: "${userText}"\n\n` +
-        `🤖 Бот временно отключен в этом чате. Чтобы вернуть бота назад, напишите в этот чат команду: "Алия включись"`;
+        `💬 Сообщение: "${userText}"\n\n` +
+        `🤖 Бот отключен. Чтобы запустить бота обратно в этом чате, отправьте фразу: "Алия включись"`;
       
       await sendGreenApiMessage(`${ADMIN_PHONE}@c.us`, alertAdminText);
     }
     return;
   }
 
-  // Стандартная обработка (2ГИС)
+  // Обработка стандартного перехода из 2ГИС
   if (lowerText.includes('2гис') || lowerText.includes('2gis') || lowerText.includes('нашел вас в')) {
     await sendGreenApiMessage(chatId, MAPS_REFERRAL_TEMPLATE);
     await saveMessageToDB(chatId, 'user', userText);
     await saveMessageToDB(chatId, 'model', MAPS_REFERRAL_TEMPLATE);
     return;
   }
+
+  await saveMessageToDB(chatId, 'user', userText);
+  const dbHistory = await getAIHistory(chatId);
+  const availabilityContext = await buildAvailabilityContext();
+
+  const messagesForGroq = [
+    { role: 'system', content: SYSTEM_PROMPT + availabilityContext },
+    ...dbHistory
+  ];
+
+  let aiText = '';
+  try {
+    const chatCompletion = await groq.chat.completions.create({
+      messages: messagesForGroq,
+      model: GROQ_MODEL,
+      temperature: 0.7,
+      max_tokens: 1024
+    });
+    aiText = chatCompletion.choices[0]?.message?.content?.trim() || '';
+  } catch (groqErr) {
+    console.error('❌ Ошибка Groq API:', groqErr.message);
+    aiText = QUOTA_ERROR_TEMPLATE;
+  }
+
+  if (!aiText) {
+    console.log(`⚠️ ИИ вернул пустой текст для [${chatId}]`);
+    return;
+  }
+
+  const { cleanText, booking } = extractBooking(aiText);
+
+  await sendGreenApiMessage(chatId, cleanText);
+  await saveMessageToDB(chatId, 'model', aiText);
+  console.log(`🤖 Ответил для [${chatId}]: ${cleanText}`);
+
+  if (booking) {
+    console.log('📋 Извлечена заявка из ответа ИИ:', JSON.stringify(booking));
+
+    try {
+      const checkInDate = new Date(booking.checkin_date + 'T00:00:00Z');
+      const nightsCount = parseInt(booking.nights) || 1;
+      const checkOutDate = new Date(checkInDate);
+      checkOutDate.setUTCDate(checkOutDate.getUTCDate() + nightsCount);
+
+      const checkInStr = booking.checkin_date;
+      const checkOutStr = checkOutDate.toISOString().split('T')[0];
+
+      let roomTypeSearch = 'standard';
+      const serviceLower = (booking.service || '').toLowerCase();
+      if (serviceLower.includes('делюкс') || serviceLower.includes('deluxe')) roomTypeSearch = 'deluxe';
+      if (serviceLower.includes('семейный') || serviceLower.includes('suite') || serviceLower.includes('family')) roomTypeSearch = 'suite';
+
+      const { data: allRooms, error: roomsError } = await supabase
+        .from('rooms')
+        .select('id, room_number')
+        .eq('type', roomTypeSearch)
+        .eq('is_active', true);
+
+      if (roomsError || !allRooms || allRooms.length === 0) {
+        throw new Error('Нет доступных комнат выбранной категории в базе данных.');
+      }
+
+      let targetRoom = null;
+
+      for (const room of allRooms) {
+        const { data: conflicts } = await supabase
+          .from('bookings')
+          .select('id')
+          .eq('room_id', room.id)
+          .eq('status', 'confirmed')
+          .lt('check_in', checkOutStr)
+          .gt('check_out', checkInStr);
+
+        if (!conflicts || conflicts.length === 0) {
+          targetRoom = room;
+          break;
+        }
+      }
+
+      if (!targetRoom) {
+        await sendGreenApiMessage(chatId, "К сожалению, все номера этой категории на выбранные даты уже заняты.");
+        return;
+      }
+
+      const bookingResult = await createBooking({
+        roomId: targetRoom.id,
+        guestName: booking.name,
+        guestPhone: booking.phone,
+        checkIn: checkInStr,
+        checkOut: checkOutStr
+      });
+
+      if (bookingResult.success) {
+        console.log(`💾 ЗАЯВКА УСПЕШНО СОХРАНЕНА ЧЕРЕЗ КЛАСС БРОНИРОВАНИЯ: ${booking.name}`);
+        await notifyAdminAboutBooking(booking, chatId, targetRoom.room_number);
+      } else {
+        console.error('❌ База данных отклонила бронь:', bookingResult.error);
+        await sendGreenApiMessage(chatId, `Ошибка бронирования: ${bookingResult.error}`);
+      }
+
+    } catch (err) {
+      console.error('❌ Ошибка в процессе автоматического бронирования:', err.message);
+      await notifyAdminAboutBooking(booking, chatId, 'Ошибка автоподбора');
+    }
+  }
 }
-  // ... дальше ваш стандартный код с отправкой запроса в Groq ...
 
 // ==============================
 // ЭНДПОИНТ /webhook
 // ==============================
-
 app.post('/webhook', async (req, res) => {
   try {
     await handleIncomingMessage(req.body);
     res.sendStatus(200);
   } catch (error) {
     console.error('❌ Критическая ошибка в /webhook:', error.message);
-    res.sendStatus(200); 
+    res.sendStatus(200);
   }
 });
 
